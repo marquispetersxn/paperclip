@@ -2502,7 +2502,7 @@ export function accessRoutes(
             isNull(joinRequests.claimSecretConsumedAt)
           )
         )
-        .returning({ id: joinRequests.id })
+        .returning()
         .then((rows) => rows[0] ?? null);
       if (!consumed) throw conflict("Claim secret already used");
 

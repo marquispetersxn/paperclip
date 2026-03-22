@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import type { IncomingMessage, Server as HttpServer } from "node:http";
-import { createRequire } from "node:module";
 import type { Duplex } from "node:stream";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -9,6 +8,11 @@ import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { PetraWebSocket, PetraWebSocketServer, READY_STATE } from "../sovereign/petra-websocket.js";
+
+// Sovereign drop-ins for ws
+const WebSocket = { OPEN: READY_STATE.OPEN } as const;
+const WebSocketServer = PetraWebSocketServer;
 
 interface WsSocket {
   readyState: number;
@@ -33,12 +37,6 @@ interface WsServer {
   ): void;
   emit(event: "connection", ws: WsSocket, req: IncomingMessage): boolean;
 }
-
-const require = createRequire(import.meta.url);
-const { WebSocket, WebSocketServer } = require("ws") as {
-  WebSocket: { OPEN: number };
-  WebSocketServer: new (opts: { noServer: boolean }) => WsServer;
-};
 
 interface UpgradeContext {
   companyId: string;
@@ -183,7 +181,7 @@ export function setupLiveEventsWebSocketServer(
     resolveSessionFromHeaders?: (headers: Headers) => Promise<BetterAuthSessionResult | null>;
   },
 ) {
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true }) as unknown as WsServer;
   const cleanupByClient = new Map<WsSocket, () => void>();
   const aliveByClient = new Map<WsSocket, boolean>();
 

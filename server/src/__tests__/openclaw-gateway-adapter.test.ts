@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createServer } from "node:http";
-import { WebSocketServer } from "ws";
+import { WebSocketServer } from "../sovereign/petra-websocket.js";
 import { execute, testEnvironment } from "@paperclipai/adapter-openclaw-gateway/server";
 import {
   buildOpenClawGatewayConfig,

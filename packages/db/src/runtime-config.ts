@@ -9,7 +9,7 @@ const INSTANCE_ID_RE = /^[a-zA-Z0-9_-]+$/;
 
 type PartialConfig = {
   database?: {
-    mode?: "embedded-postgres" | "postgres";
+    mode?: "embedded-postgres" | "postgres" | "pglite";
     connectionString?: string;
     embeddedPostgresDataDir?: string;
     embeddedPostgresPort?: number;
@@ -31,6 +31,13 @@ export type ResolvedDatabaseTarget =
       dataDir: string;
       port: number;
       source: `embedded-postgres@${number}`;
+      configPath: string;
+      envPath: string;
+    }
+  | {
+      mode: "pglite";
+      dataDir: string;
+      source: "pglite";
       configPath: string;
       envPath: string;
     };
@@ -66,6 +73,10 @@ function resolveDefaultConfigPath(): string {
 
 function resolveDefaultEmbeddedPostgresDir(): string {
   return path.resolve(resolvePaperclipHomeDir(), "instances", resolvePaperclipInstanceId(), "db");
+}
+
+function resolveDefaultPgliteDir(): string {
+  return path.resolve(resolvePaperclipHomeDir(), "instances", resolvePaperclipInstanceId(), "pgdata");
 }
 
 function resolveHomeAwarePath(value: string): string {
@@ -197,7 +208,11 @@ function readConfig(configPath: string): PartialConfig | null {
   return {
     database: database
       ? {
-          mode: database.mode === "postgres" ? "postgres" : "embedded-postgres",
+          mode: database.mode === "postgres"
+            ? "postgres"
+            : database.mode === "pglite"
+            ? "pglite"
+            : "embedded-postgres",
           connectionString:
             typeof database.connectionString === "string" ? database.connectionString : undefined,
           embeddedPostgresDataDir:
@@ -246,6 +261,19 @@ export function resolveDatabaseTarget(): ResolvedDatabaseTarget {
       mode: "postgres",
       connectionString,
       source: "config.database.connectionString",
+      configPath,
+      envPath,
+    };
+  }
+
+  if (config?.database?.mode === "pglite") {
+    const pgliteDataDir = resolveHomeAwarePath(
+      config.database.pgliteDataDir ?? resolveDefaultPgliteDir(),
+    );
+    return {
+      mode: "pglite",
+      dataDir: pgliteDataDir,
+      source: "pglite",
       configPath,
       envPath,
     };

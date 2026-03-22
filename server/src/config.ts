@@ -1,6 +1,6 @@
 import { readConfigFile } from "./config-file.js";
 import { existsSync } from "node:fs";
-import { config as loadDotenv } from "dotenv";
+import { loadEnv } from "./sovereign/env-loader.js";
 import { resolvePaperclipEnvPath } from "./paths.js";
 import {
   AUTH_BASE_URL_MODES,
@@ -24,7 +24,7 @@ import {
 
 const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
 if (existsSync(PAPERCLIP_ENV_FILE_PATH)) {
-  loadDotenv({ path: PAPERCLIP_ENV_FILE_PATH, override: false, quiet: true });
+  loadEnv(PAPERCLIP_ENV_FILE_PATH);
 }
 
 type DatabaseMode = "embedded-postgres" | "postgres";

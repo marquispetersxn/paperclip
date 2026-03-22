@@ -1,11 +1,11 @@
 /// <reference path="./types/express.d.ts" />
-import { existsSync, readFileSync, rmSync } from "node:fs";
+// [PetraTerraform] express import replaced with PetraHTTP bridge types
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { pathToFileURL } from "node:url";
-import type { Request as ExpressRequest, RequestHandler } from "express";
+import type { PetraRequest as ExpressRequest, ExpressHandler as RequestHandler } from "./petra-bridge.js";
 import { and, eq } from "drizzle-orm";
 import {
   createDb,
@@ -40,23 +40,6 @@ type BetterAuthSessionResult = {
   session: { id: string; userId: string } | null;
   user: BetterAuthSessionUser | null;
 };
-
-type EmbeddedPostgresInstance = {
-  initialise(): Promise<void>;
-  start(): Promise<void>;
-  stop(): Promise<void>;
-};
-
-type EmbeddedPostgresCtor = new (opts: {
-  databaseDir: string;
-  user: string;
-  password: string;
-  port: number;
-  persistent: boolean;
-  onLog?: (message: unknown) => void;
-  onError?: (message: unknown) => void;
-}) => EmbeddedPostgresInstance;
-
 
 export interface StartedServer {
   server: ReturnType<typeof createServer>;
@@ -230,157 +213,54 @@ export async function startServer(): Promise<StartedServer> {
   }
   
   let db;
-  let embeddedPostgres: EmbeddedPostgresInstance | null = null;
-  let embeddedPostgresStartedByThisProcess = false;
   let migrationSummary: MigrationSummary = "skipped";
   let activeDatabaseConnectionString: string;
   let startupDbInfo:
     | { mode: "external-postgres"; connectionString: string }
-    | { mode: "embedded-postgres"; dataDir: string; port: number };
+    | { mode: "pglite"; dataDir: string };
+
   if (config.databaseUrl) {
     migrationSummary = await ensureMigrations(config.databaseUrl, "PostgreSQL");
-  
+
     db = createDb(config.databaseUrl);
     logger.info("Using external PostgreSQL via DATABASE_URL/config");
     activeDatabaseConnectionString = config.databaseUrl;
     startupDbInfo = { mode: "external-postgres", connectionString: config.databaseUrl };
   } else {
-    const moduleName = "embedded-postgres";
-    let EmbeddedPostgres: EmbeddedPostgresCtor;
-    try {
-      const mod = await import(moduleName);
-      EmbeddedPostgres = mod.default as EmbeddedPostgresCtor;
-    } catch {
-      throw new Error(
-        "Embedded PostgreSQL mode requires dependency `embedded-postgres`. Reinstall dependencies (without omitting required packages), or set DATABASE_URL for external Postgres.",
-      );
-    }
-  
+    // Default embedded mode: PGlite (WASM PostgreSQL — no native binary required)
+    const { initEmbeddedDatabase, shutdownEmbeddedDatabase } = await import("@paperclipai/db/embedded-database");
     const dataDir = resolve(config.embeddedPostgresDataDir);
-    const configuredPort = config.embeddedPostgresPort;
-    let port = configuredPort;
-    const embeddedPostgresLogBuffer: string[] = [];
-    const EMBEDDED_POSTGRES_LOG_BUFFER_LIMIT = 120;
-    const verboseEmbeddedPostgresLogs = process.env.PAPERCLIP_EMBEDDED_POSTGRES_VERBOSE === "true";
-    const appendEmbeddedPostgresLog = (message: unknown) => {
-      const text = typeof message === "string" ? message : message instanceof Error ? message.message : String(message ?? "");
-      for (const lineRaw of text.split(/\r?\n/)) {
-        const line = lineRaw.trim();
-        if (!line) continue;
-        embeddedPostgresLogBuffer.push(line);
-        if (embeddedPostgresLogBuffer.length > EMBEDDED_POSTGRES_LOG_BUFFER_LIMIT) {
-          embeddedPostgresLogBuffer.splice(0, embeddedPostgresLogBuffer.length - EMBEDDED_POSTGRES_LOG_BUFFER_LIMIT);
-        }
-        if (verboseEmbeddedPostgresLogs) {
-          logger.info({ embeddedPostgresLog: line }, "embedded-postgres");
-        }
-      }
-    };
-    const logEmbeddedPostgresFailure = (phase: "initialise" | "start", err: unknown) => {
-      if (embeddedPostgresLogBuffer.length > 0) {
-        logger.error(
-          {
-            phase,
-            recentLogs: embeddedPostgresLogBuffer,
-            err,
-          },
-          "Embedded PostgreSQL failed; showing buffered startup logs",
-        );
-      }
-    };
-  
+
     if (config.databaseMode === "postgres") {
-      logger.warn("Database mode is postgres but no connection string was set; falling back to embedded PostgreSQL");
+      logger.warn("Database mode is postgres but no connection string was set; falling back to embedded PGlite");
     }
-  
-    const clusterVersionFile = resolve(dataDir, "PG_VERSION");
-    const clusterAlreadyInitialized = existsSync(clusterVersionFile);
-    const postmasterPidFile = resolve(dataDir, "postmaster.pid");
-    const isPidRunning = (pid: number): boolean => {
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch {
-        return false;
-      }
-    };
-  
-    const getRunningPid = (): number | null => {
-      if (!existsSync(postmasterPidFile)) return null;
-      try {
-        const pidLine = readFileSync(postmasterPidFile, "utf8").split("\n")[0]?.trim();
-        const pid = Number(pidLine);
-        if (!Number.isInteger(pid) || pid <= 0) return null;
-        if (!isPidRunning(pid)) return null;
-        return pid;
-      } catch {
-        return null;
-      }
-    };
-  
-    const runningPid = getRunningPid();
-    if (runningPid) {
-      logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${runningPid}, port=${port})`);
-    } else {
-      const detectedPort = await detectPort(configuredPort);
-      if (detectedPort !== configuredPort) {
-        logger.warn(`Embedded PostgreSQL port is in use; using next free port (requestedPort=${configuredPort}, selectedPort=${detectedPort})`);
-      }
-      port = detectedPort;
-      logger.info(`Using embedded PostgreSQL because no DATABASE_URL set (dataDir=${dataDir}, port=${port})`);
-      embeddedPostgres = new EmbeddedPostgres({
-        databaseDir: dataDir,
-        user: "paperclip",
-        password: "paperclip",
-        port,
-        persistent: true,
-        onLog: appendEmbeddedPostgresLog,
-        onError: appendEmbeddedPostgresLog,
-      });
-  
-      if (!clusterAlreadyInitialized) {
-        try {
-          await embeddedPostgres.initialise();
-        } catch (err) {
-          logEmbeddedPostgresFailure("initialise", err);
-          throw err;
-        }
-      } else {
-        logger.info(`Embedded PostgreSQL cluster already exists (${clusterVersionFile}); skipping init`);
-      }
-  
-      if (existsSync(postmasterPidFile)) {
-        logger.warn("Removing stale embedded PostgreSQL lock file");
-        rmSync(postmasterPidFile, { force: true });
-      }
-      try {
-        await embeddedPostgres.start();
-      } catch (err) {
-        logEmbeddedPostgresFailure("start", err);
-        throw err;
-      }
-      embeddedPostgresStartedByThisProcess = true;
-    }
-  
-    const embeddedAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
-    const dbStatus = await ensurePostgresDatabase(embeddedAdminConnectionString, "paperclip");
-    if (dbStatus === "created") {
-      logger.info("Created embedded PostgreSQL database: paperclip");
-    }
-  
-    const embeddedConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
-    const shouldAutoApplyFirstRunMigrations = !clusterAlreadyInitialized || dbStatus === "created";
-    if (shouldAutoApplyFirstRunMigrations) {
-      logger.info("Detected first-run embedded PostgreSQL setup; applying pending migrations automatically");
-    }
-    migrationSummary = await ensureMigrations(embeddedConnectionString, "Embedded PostgreSQL", {
-      autoApply: shouldAutoApplyFirstRunMigrations,
+
+    logger.info(`Using embedded PGlite (WASM PostgreSQL) because no DATABASE_URL set (dataDir=${dataDir})`);
+    await initEmbeddedDatabase(dataDir);
+
+    const pgliteConnectionString = `pglite://${dataDir}`;
+    migrationSummary = await ensureMigrations(pgliteConnectionString, "Embedded PGlite", {
+      autoApply: true,
     });
-  
-    db = createDb(embeddedConnectionString);
-    logger.info("Embedded PostgreSQL ready");
-    activeDatabaseConnectionString = embeddedConnectionString;
-    startupDbInfo = { mode: "embedded-postgres", dataDir, port };
+
+    db = createDb(pgliteConnectionString);
+    logger.info("Embedded PGlite ready");
+    activeDatabaseConnectionString = pgliteConnectionString;
+    startupDbInfo = { mode: "pglite", dataDir };
+
+    // Register PGlite shutdown handler
+    const shutdownPglite = async (signal: "SIGINT" | "SIGTERM") => {
+      logger.info({ signal }, "Stopping embedded PGlite database");
+      try {
+        await shutdownEmbeddedDatabase();
+      } catch (err) {
+        logger.error({ err }, "Failed to stop embedded PGlite cleanly");
+      } finally {
+        process.exit(0);
+      }
+    };
+    process.once("SIGINT", () => { void shutdownPglite("SIGINT"); });
+    process.once("SIGTERM", () => { void shutdownPglite("SIGTERM"); });
   }
   
   if (config.deploymentMode === "local_trusted" && !isLoopbackHost(config.host)) {
@@ -453,8 +333,8 @@ export async function startServer(): Promise<StartedServer> {
       "Authenticated mode auth origin configuration",
     );
     const auth = createBetterAuthInstance(db as any, config, effectiveTrustedOrigins);
-    betterAuthHandler = createBetterAuthHandler(auth);
-    resolveSession = (req) => resolveBetterAuthSession(auth, req);
+    betterAuthHandler = createBetterAuthHandler(auth) as any;
+    resolveSession = (req) => resolveBetterAuthSession(auth, req as any);
     resolveSessionFromHeaders = (headers) => resolveBetterAuthSessionFromHeaders(auth, headers);
     await initializeBoardClaimChallenge(db as any, { deploymentMode: config.deploymentMode });
     authReady = true;
@@ -476,7 +356,8 @@ export async function startServer(): Promise<StartedServer> {
     betterAuthHandler,
     resolveSession,
   });
-  const server = createServer(app as unknown as Parameters<typeof createServer>[0]);
+  // [PetraTerraform] use PetraApp's requestListener (sovereign HTTP handler)
+  const server = createServer(app.requestListener);
   
   if (listenPort !== config.port) {
     logger.warn(`Requested port is busy; using next free port (requestedPort=${config.port}, selectedPort=${listenPort})`);
@@ -646,26 +527,6 @@ export async function startServer(): Promise<StartedServer> {
     });
   });
   
-  if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
-    const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
-      logger.info({ signal }, "Stopping embedded PostgreSQL");
-      try {
-        await embeddedPostgres?.stop();
-      } catch (err) {
-        logger.error({ err }, "Failed to stop embedded PostgreSQL cleanly");
-      } finally {
-        process.exit(0);
-      }
-    };
-  
-    process.once("SIGINT", () => {
-      void shutdown("SIGINT");
-    });
-    process.once("SIGTERM", () => {
-      void shutdown("SIGTERM");
-    });
-  }
-
   return {
     server,
     host: config.host,

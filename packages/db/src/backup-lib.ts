@@ -3,6 +3,11 @@ import { readFile, writeFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import postgres from "postgres";
 
+/** Returns true for PGlite sentinel URLs — backup is not supported for in-process PGlite. */
+function isPgliteUrl(url: string): boolean {
+  return url.startsWith("pglite://");
+}
+
 export type RunDatabaseBackupOptions = {
   connectionString: string;
   backupDir: string;
@@ -142,6 +147,13 @@ function tableKey(schemaName: string, tableName: string): string {
 }
 
 export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise<RunDatabaseBackupResult> {
+  if (isPgliteUrl(opts.connectionString)) {
+    throw new Error(
+      "Database backup is not supported for embedded PGlite mode. " +
+      "Use an external PostgreSQL instance (set DATABASE_URL) to enable automatic backups.",
+    );
+  }
+
   const filenamePrefix = opts.filenamePrefix ?? "paperclip";
   const retentionDays = Math.max(1, Math.trunc(opts.retentionDays));
   const connectTimeout = Math.max(1, Math.trunc(opts.connectTimeoutSeconds ?? 5));
@@ -522,6 +534,13 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 }
 
 export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promise<void> {
+  if (isPgliteUrl(opts.connectionString)) {
+    throw new Error(
+      "Database restore is not supported for embedded PGlite mode. " +
+      "Use an external PostgreSQL instance (set DATABASE_URL) to enable backup/restore.",
+    );
+  }
+
   const connectTimeout = Math.max(1, Math.trunc(opts.connectTimeoutSeconds ?? 5));
   const sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
 

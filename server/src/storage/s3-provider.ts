@@ -1,13 +1,13 @@
-import {
-  S3Client,
-  DeleteObjectCommand,
-  GetObjectCommand,
-  HeadObjectCommand,
-  PutObjectCommand,
-} from "@aws-sdk/client-s3";
 import { Readable } from "node:stream";
 import type { StorageProvider, GetObjectResult, HeadObjectResult } from "./types.js";
 import { notFound, unprocessable } from "../errors.js";
+import {
+  PetraS3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  DeleteObjectCommand,
+  HeadObjectCommand,
+} from "../sovereign/petra-s3.js";
 
 interface S3ProviderConfig {
   bucket: string;
@@ -30,35 +30,6 @@ function buildKey(prefix: string, objectKey: string): string {
   return `${prefix}/${objectKey}`;
 }
 
-async function toReadableStream(body: unknown): Promise<Readable> {
-  if (!body) throw notFound("Object not found");
-  if (body instanceof Readable) return body;
-
-  const candidate = body as {
-    transformToWebStream?: () => ReadableStream<Uint8Array>;
-    arrayBuffer?: () => Promise<ArrayBuffer>;
-  };
-
-  if (typeof candidate.transformToWebStream === "function") {
-    const webStream = candidate.transformToWebStream();
-    const reader = webStream.getReader();
-    return Readable.from((async function* () {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) yield value;
-      }
-    })());
-  }
-
-  if (typeof candidate.arrayBuffer === "function") {
-    const buffer = Buffer.from(await candidate.arrayBuffer());
-    return Readable.from(buffer);
-  }
-
-  throw unprocessable("Unsupported S3 body stream type");
-}
-
 function toDate(value: Date | undefined): Date | undefined {
   return value instanceof Date ? value : undefined;
 }
@@ -70,9 +41,20 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
   if (!region) throw unprocessable("S3 storage region is required");
 
   const prefix = normalizePrefix(config.prefix);
-  const client = new S3Client({
+
+  // Build a valid endpoint — PetraS3Client requires a full URL
+  let endpoint = config.endpoint ?? `https://s3.${region}.amazonaws.com`;
+  if (!endpoint.startsWith('http://') && !endpoint.startsWith('https://')) {
+    endpoint = `https://${endpoint}`;
+  }
+
+  const client = new PetraS3Client({
+    endpoint,
     region,
-    endpoint: config.endpoint,
+    credentials: {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID ?? process.env.S3_ACCESS_KEY_ID ?? "",
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? process.env.S3_SECRET_ACCESS_KEY ?? "",
+    },
     forcePathStyle: Boolean(config.forcePathStyle),
   });
 
@@ -87,7 +69,6 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
           Key: key,
           Body: input.body,
           ContentType: input.contentType,
-          ContentLength: input.contentLength,
         }),
       );
     },
@@ -102,16 +83,19 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
           }),
         );
 
+        // output.Body is already a Readable from petra-s3
+        const stream = output.Body as Readable;
+
         return {
-          stream: await toReadableStream(output.Body),
+          stream,
           contentType: output.ContentType,
           contentLength: output.ContentLength,
           etag: output.ETag,
           lastModified: toDate(output.LastModified),
         };
       } catch (err) {
-        const code = (err as { name?: string }).name;
-        if (code === "NoSuchKey" || code === "NotFound") throw notFound("Object not found");
+        const code = (err as { code?: string }).code;
+        if (code === "NoSuchKey" || code === "NotFound" || code === "404") throw notFound("Object not found");
         throw err;
       }
     },
@@ -134,8 +118,8 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
           lastModified: toDate(output.LastModified),
         };
       } catch (err) {
-        const code = (err as { name?: string }).name;
-        if (code === "NoSuchKey" || code === "NotFound") return { exists: false };
+        const code = (err as { code?: string }).code;
+        if (code === "NoSuchKey" || code === "NotFound" || code === "404") return { exists: false };
         throw err;
       }
     },

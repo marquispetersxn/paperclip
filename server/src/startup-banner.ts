@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolvePaperclipConfigPath, resolvePaperclipEnvPath } from "./paths.js";
 import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
 
-import { parse as parseEnvFileContents } from "dotenv";
+import { parseEnv as parseEnvFileContents } from "./sovereign/env-loader.js";
 
 type UiMode = "none" | "static" | "vite-dev";
 
@@ -17,6 +17,11 @@ type EmbeddedPostgresInfo = {
   port: number;
 };
 
+type PgliteInfo = {
+  mode: "pglite";
+  dataDir: string;
+};
+
 type StartupBannerOptions = {
   host: string;
   deploymentMode: DeploymentMode;
@@ -25,7 +30,7 @@ type StartupBannerOptions = {
   requestedPort: number;
   listenPort: number;
   uiMode: UiMode;
-  db: ExternalPostgresInfo | EmbeddedPostgresInfo;
+  db: ExternalPostgresInfo | EmbeddedPostgresInfo | PgliteInfo;
   migrationSummary: string;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
@@ -106,7 +111,9 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
   const agentJwtSecret = resolveAgentJwtSecretStatus(envFilePath);
 
   const dbMode =
-    opts.db.mode === "embedded-postgres"
+    opts.db.mode === "pglite"
+      ? color("pglite (embedded)", "green")
+      : opts.db.mode === "embedded-postgres"
       ? color("embedded-postgres", "green")
       : color("external-postgres", "yellow");
   const uiMode =
@@ -122,7 +129,9 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
       : `${opts.listenPort} ${color(`(requested ${opts.requestedPort})`, "dim")}`;
 
   const dbDetails =
-    opts.db.mode === "embedded-postgres"
+    opts.db.mode === "pglite"
+      ? `${opts.db.dataDir} ${color("(in-process WASM)", "dim")}`
+      : opts.db.mode === "embedded-postgres"
       ? `${opts.db.dataDir} ${color(`(pg:${opts.db.port})`, "dim")}`
       : redactConnectionString(opts.db.connectionString);
 

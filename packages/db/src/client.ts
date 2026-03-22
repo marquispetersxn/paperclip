@@ -1,14 +1,21 @@
 import { createHash } from "node:crypto";
 import { drizzle as drizzlePg } from "drizzle-orm/postgres-js";
+import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
 import { migrate as migratePg } from "drizzle-orm/postgres-js/migrator";
 import { readFile, readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
 import * as schema from "./schema/index.js";
+import { getEmbeddedDatabase } from "./embedded-database.js";
 
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
 const MIGRATIONS_JOURNAL_JSON = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
+
+/** Returns true when the URL is a pglite:// sentinel (no TCP connection needed). */
+function isPgliteUrl(url: string): boolean {
+  return url.startsWith("pglite://");
+}
 
 function createUtilitySql(url: string) {
   return postgres(url, { max: 1, onnotice: () => {} });
@@ -46,6 +53,10 @@ export type MigrationState =
     };
 
 export function createDb(url: string) {
+  if (isPgliteUrl(url)) {
+    const db = getEmbeddedDatabase();
+    return drizzlePglite(db, { schema });
+  }
   const sql = postgres(url);
   return drizzlePg(sql, { schema });
 }
@@ -471,6 +482,11 @@ export type MigrationHistoryReconcileResult = {
 export async function reconcilePendingMigrationHistory(
   url: string,
 ): Promise<MigrationHistoryReconcileResult> {
+  // PGlite: reconciliation is not needed — pgliteApplyMigrations handles idempotency natively.
+  if (isPgliteUrl(url)) {
+    return { repairedMigrations: [], remainingMigrations: [] };
+  }
+
   const state = await inspectMigrations(url);
   if (state.status !== "needsMigrations" || state.reason !== "pending-migrations") {
     return { repairedMigrations: [], remainingMigrations: [] };
@@ -582,7 +598,248 @@ async function discoverMigrationTableSchema(sql: ReturnType<typeof postgres>): P
   return rows[0]?.schemaName ?? null;
 }
 
+// ---------------------------------------------------------------------------
+// PGlite-native migration helpers (no TCP connection required)
+// ---------------------------------------------------------------------------
+
+async function pgliteDiscoverMigrationTableSchema(): Promise<string | null> {
+  const db = getEmbeddedDatabase();
+  const result = await db.query<{ schemaName: string }>(
+    `SELECT n.nspname AS "schemaName"
+     FROM pg_class c
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relname = $1 AND c.relkind = 'r'`,
+    [DRIZZLE_MIGRATIONS_TABLE],
+  );
+  const rows = result.rows;
+  if (rows.length === 0) return null;
+  const drizzleSchema = rows.find(({ schemaName }) => schemaName === "drizzle");
+  if (drizzleSchema) return drizzleSchema.schemaName;
+  const publicSchema = rows.find(({ schemaName }) => schemaName === "public");
+  if (publicSchema) return publicSchema.schemaName;
+  return rows[0]?.schemaName ?? null;
+}
+
+async function pgliteGetTableCount(): Promise<number> {
+  const db = getEmbeddedDatabase();
+  const result = await db.query<{ count: number }>(
+    `SELECT count(*)::int AS count
+     FROM information_schema.tables
+     WHERE table_schema = 'public'
+       AND table_type = 'BASE TABLE'`,
+  );
+  return result.rows[0]?.count ?? 0;
+}
+
+async function pgliteGetMigrationTableColumnNames(schema: string): Promise<Set<string>> {
+  const db = getEmbeddedDatabase();
+  const result = await db.query<{ column_name: string }>(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = $1 AND table_name = $2`,
+    [schema, DRIZZLE_MIGRATIONS_TABLE],
+  );
+  return new Set(result.rows.map((r) => r.column_name));
+}
+
+async function pgliteEnsureMigrationJournalTable(): Promise<{ schema: string; columns: Set<string> }> {
+  let schema = await pgliteDiscoverMigrationTableSchema();
+  if (!schema) {
+    const db = getEmbeddedDatabase();
+    await db.exec(`CREATE SCHEMA IF NOT EXISTS "drizzle"`);
+    await db.exec(
+      `CREATE TABLE IF NOT EXISTS "drizzle"."${DRIZZLE_MIGRATIONS_TABLE}" (id SERIAL PRIMARY KEY, hash text NOT NULL, created_at bigint)`,
+    );
+    schema = (await pgliteDiscoverMigrationTableSchema()) ?? "drizzle";
+  }
+  const columns = await pgliteGetMigrationTableColumnNames(schema);
+  return { schema, columns };
+}
+
+async function pgliteLoadAppliedMigrations(
+  migrationTableSchema: string,
+  columnNames: Set<string>,
+  availableMigrations: string[],
+): Promise<string[]> {
+  const db = getEmbeddedDatabase();
+  const qualifiedTable = `"${migrationTableSchema}"."${DRIZZLE_MIGRATIONS_TABLE}"`;
+
+  if (columnNames.has("name")) {
+    const result = await db.query<{ name: string }>(
+      `SELECT name FROM ${qualifiedTable} ORDER BY id`,
+    );
+    return result.rows.map((r) => r.name).filter(Boolean);
+  }
+
+  if (columnNames.has("hash")) {
+    const result = await db.query<{ hash: string }>(
+      `SELECT hash FROM ${qualifiedTable} ORDER BY id`,
+    );
+    const hashesToFiles = await mapHashesToMigrationFiles(availableMigrations);
+    const resolved = result.rows
+      .map((r) => hashesToFiles.get(r.hash))
+      .filter((n): n is string => Boolean(n));
+    if (resolved.length > 0) return resolved;
+
+    if (columnNames.has("created_at")) {
+      const journalEntries = await listJournalMigrationEntries();
+      if (journalEntries.length > 0) {
+        const lastResult = await db.query<{ created_at: string | number | null }>(
+          `SELECT created_at FROM ${qualifiedTable} ORDER BY created_at DESC LIMIT 1`,
+        );
+        const lastCreatedAt = Number(lastResult.rows[0]?.created_at ?? -1);
+        if (Number.isFinite(lastCreatedAt) && lastCreatedAt >= 0) {
+          return journalEntries
+            .filter((e) => availableMigrations.includes(e.fileName))
+            .filter((e) => e.folderMillis <= lastCreatedAt)
+            .map((e) => e.fileName)
+            .slice(0, result.rows.length);
+        }
+      }
+    }
+  }
+
+  const idResult = await db.query<{ id: number }>(`SELECT id FROM ${qualifiedTable} ORDER BY id`);
+  const journalFiles = await listJournalMigrationFiles();
+  const fromIds = idResult.rows
+    .map((r) => journalFiles[r.id - 1])
+    .filter((n): n is string => Boolean(n));
+  if (fromIds.length > 0) return fromIds;
+
+  return availableMigrations.slice(0, Math.max(0, idResult.rows.length));
+}
+
+async function pgliteApplyMigrations(pendingMigrations: string[]): Promise<void> {
+  if (pendingMigrations.length === 0) return;
+
+  const db = getEmbeddedDatabase();
+  const orderedMigrations = await orderMigrationsByJournal(pendingMigrations);
+  const journalEntries = await listJournalMigrationEntries();
+  const folderMillisByFileName = new Map(
+    journalEntries.map((e) => [e.fileName, normalizeFolderMillis(e.folderMillis)]),
+  );
+
+  const { schema, columns } = await pgliteEnsureMigrationJournalTable();
+  const qualifiedTable = `"${schema}"."${DRIZZLE_MIGRATIONS_TABLE}"`;
+
+  for (const migrationFile of orderedMigrations) {
+    const migrationContent = await readMigrationFileContent(migrationFile);
+    const hash = createHash("sha256").update(migrationContent).digest("hex");
+
+    // Check if already applied
+    const predicates: string[] = [];
+    const predicateValues: string[] = [];
+    if (columns.has("hash")) {
+      predicates.push(`hash = $${predicateValues.length + 1}`);
+      predicateValues.push(hash);
+    }
+    if (columns.has("name")) {
+      predicates.push(`name = $${predicateValues.length + 1}`);
+      predicateValues.push(migrationFile);
+    }
+    if (predicates.length > 0) {
+      const existsResult = await db.query<{ one: number }>(
+        `SELECT 1 AS one FROM ${qualifiedTable} WHERE ${predicates.join(" OR ")} LIMIT 1`,
+        predicateValues,
+      );
+      if (existsResult.rows.length > 0) continue;
+    }
+
+    // Apply migration in a transaction
+    await db.exec("BEGIN");
+    try {
+      for (const statement of splitMigrationStatements(migrationContent)) {
+        await db.exec(statement);
+      }
+
+      // Record migration
+      const insertCols: string[] = [];
+      const insertVals: string[] = [];
+      if (columns.has("hash")) {
+        insertCols.push('"hash"');
+        insertVals.push(`'${hash.replaceAll("'", "''")}'`);
+      }
+      if (columns.has("name")) {
+        insertCols.push('"name"');
+        insertVals.push(`'${migrationFile.replaceAll("'", "''")}'`);
+      }
+      if (columns.has("created_at")) {
+        const lastResult = await db.query<{ created_at: string | number | null }>(
+          `SELECT created_at FROM ${qualifiedTable} ORDER BY created_at DESC NULLS LAST LIMIT 1`,
+        );
+        const lastCreatedAt = Number(lastResult.rows[0]?.created_at ?? Number.NaN);
+        const folderMillis = folderMillisByFileName.get(migrationFile) ?? Date.now();
+        const createdAt = Number.isFinite(lastCreatedAt)
+          ? Math.max(lastCreatedAt + 1, folderMillis)
+          : folderMillis;
+        insertCols.push('"created_at"');
+        insertVals.push(`'${String(createdAt)}'`);
+      }
+
+      if (insertCols.length > 0) {
+        await db.exec(
+          `INSERT INTO ${qualifiedTable} (${insertCols.join(", ")}) VALUES (${insertVals.join(", ")})`,
+        );
+      }
+
+      await db.exec("COMMIT");
+    } catch (err) {
+      try {
+        await db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback errors — surface the original.
+      }
+      throw err;
+    }
+  }
+}
+
+async function pgliteInspectMigrations(): Promise<MigrationState> {
+  const availableMigrations = await listMigrationFiles();
+  const tableCount = await pgliteGetTableCount();
+  const migrationTableSchema = await pgliteDiscoverMigrationTableSchema();
+
+  if (!migrationTableSchema) {
+    const reason = tableCount > 0
+      ? "no-migration-journal-non-empty-db"
+      : "no-migration-journal-empty-db";
+    return {
+      status: "needsMigrations",
+      tableCount,
+      availableMigrations,
+      appliedMigrations: [],
+      pendingMigrations: availableMigrations,
+      reason,
+    };
+  }
+
+  const columnNames = await pgliteGetMigrationTableColumnNames(migrationTableSchema);
+  const appliedMigrations = await pgliteLoadAppliedMigrations(migrationTableSchema, columnNames, availableMigrations);
+  const pendingMigrations = availableMigrations.filter((name) => !appliedMigrations.includes(name));
+
+  if (pendingMigrations.length === 0) {
+    return { status: "upToDate", tableCount, availableMigrations, appliedMigrations };
+  }
+
+  return {
+    status: "needsMigrations",
+    tableCount,
+    availableMigrations,
+    appliedMigrations,
+    pendingMigrations,
+    reason: "pending-migrations",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Public migration API — routes to PGlite or postgres based on URL prefix
+// ---------------------------------------------------------------------------
+
 export async function inspectMigrations(url: string): Promise<MigrationState> {
+  if (isPgliteUrl(url)) {
+    return pgliteInspectMigrations();
+  }
+
   const sql = createUtilitySql(url);
 
   try {
@@ -643,6 +900,21 @@ export async function inspectMigrations(url: string): Promise<MigrationState> {
 }
 
 export async function applyPendingMigrations(url: string): Promise<void> {
+  if (isPgliteUrl(url)) {
+    const initialState = await pgliteInspectMigrations();
+    if (initialState.status === "upToDate") return;
+    if (initialState.status === "needsMigrations") {
+      await pgliteApplyMigrations(initialState.pendingMigrations);
+    }
+    const finalState = await pgliteInspectMigrations();
+    if (finalState.status !== "upToDate") {
+      throw new Error(
+        `Failed to apply pending PGlite migrations: ${finalState.status === "needsMigrations" ? finalState.pendingMigrations.join(", ") : "unknown"}`,
+      );
+    }
+    return;
+  }
+
   const initialState = await inspectMigrations(url);
   if (initialState.status === "upToDate") return;
 
@@ -684,6 +956,24 @@ export type MigrationBootstrapResult =
   | { migrated: false; reason: "not-empty-no-migration-journal"; tableCount: number };
 
 export async function migratePostgresIfEmpty(url: string): Promise<MigrationBootstrapResult> {
+  if (isPgliteUrl(url)) {
+    const migrationTableSchema = await pgliteDiscoverMigrationTableSchema();
+    const tableCount = await pgliteGetTableCount();
+
+    if (migrationTableSchema) {
+      return { migrated: false, reason: "already-migrated", tableCount };
+    }
+
+    if (tableCount > 0) {
+      return { migrated: false, reason: "not-empty-no-migration-journal", tableCount };
+    }
+
+    const availableMigrations = await listMigrationFiles();
+    await pgliteApplyMigrations(availableMigrations);
+
+    return { migrated: true, reason: "migrated-empty-db", tableCount: 0 };
+  }
+
   const sql = createUtilitySql(url);
 
   try {
@@ -721,6 +1011,11 @@ export async function ensurePostgresDatabase(
 ): Promise<"created" | "exists"> {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(databaseName)) {
     throw new Error(`Unsafe database name: ${databaseName}`);
+  }
+
+  // PGlite is a single embedded database — no concept of CREATE DATABASE.
+  if (isPgliteUrl(url)) {
+    return "exists";
   }
 
   const sql = createUtilitySql(url);

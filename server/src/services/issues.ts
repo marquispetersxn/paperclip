@@ -419,13 +419,7 @@ export function issueService(db: Db) {
           eq(issues.checkoutRunId, input.expectedCheckoutRunId),
         ),
       )
-      .returning({
-        id: issues.id,
-        status: issues.status,
-        assigneeAgentId: issues.assigneeAgentId,
-        checkoutRunId: issues.checkoutRunId,
-        executionRunId: issues.executionRunId,
-      })
+      .returning()
       .then((rows) => rows[0] ?? null);
 
     return adopted;
@@ -669,7 +663,7 @@ export function issueService(db: Db) {
           .update(companies)
           .set({ issueCounter: sql`${companies.issueCounter} + 1` })
           .where(eq(companies.id, companyId))
-          .returning({ issueCounter: companies.issueCounter, issuePrefix: companies.issuePrefix });
+          .returning();
 
         const issueNumber = company.issueCounter;
         const identifier = `${company.issuePrefix}-${issueNumber}`;

@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { ensurePostgresDatabase } from "./client.js";
 import { resolveDatabaseTarget } from "./runtime-config.js";
+import { initEmbeddedDatabase, shutdownEmbeddedDatabase } from "./embedded-database.js";
 
 type EmbeddedPostgresInstance = {
   initialise(): Promise<void>;
@@ -120,6 +121,19 @@ async function ensureEmbeddedPostgresConnection(
   };
 }
 
+async function ensurePgliteConnection(dataDir: string): Promise<MigrationConnection> {
+  await initEmbeddedDatabase(dataDir);
+  // PGlite has no TCP connection; return a sentinel URL that the PGlite client.ts
+  // functions will detect and route to the in-process PGlite instance.
+  return {
+    connectionString: `pglite://${dataDir}`,
+    source: "pglite",
+    stop: async () => {
+      await shutdownEmbeddedDatabase();
+    },
+  };
+}
+
 export async function resolveMigrationConnection(): Promise<MigrationConnection> {
   const target = resolveDatabaseTarget();
   if (target.mode === "postgres") {
@@ -128,6 +142,10 @@ export async function resolveMigrationConnection(): Promise<MigrationConnection>
       source: target.source,
       stop: async () => {},
     };
+  }
+
+  if (target.mode === "pglite") {
+    return ensurePgliteConnection(target.dataDir);
   }
 
   return ensureEmbeddedPostgresConnection(target.dataDir, target.port);
